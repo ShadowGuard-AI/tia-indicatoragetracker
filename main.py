@@ -1,10 +1,11 @@
 import argparse
 import logging
+import base64
 import requests
-from bs4 import BeautifulSoup
 from dateutil import parser
 import datetime
 import os
+import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,6 +30,7 @@ class IndicatorAgeTracker:
         self.censys_api_id = censys_api_id
         self.censys_api_secret = censys_api_secret
         self.ioc_ages = {}  # Store IOC ages (first seen dates)
+        self.lookups_performed = 0
 
     def get_ioc_age(self, ioc):
         """
@@ -53,6 +55,15 @@ class IndicatorAgeTracker:
             logging.error(f"Error getting age for {ioc}: {e}")
         return None
 
+    @staticmethod
+    def _aware_utc(dt):
+        """Normalize a parsed datetime to timezone-aware UTC."""
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+
     def get_age_shodan(self, ip_address):
          """
          Retrieves the first seen date of an IP address using Shodan API.
@@ -68,17 +79,22 @@ class IndicatorAgeTracker:
              return None
 
          try:
-             url = f"https://api.shodan.io/shodan/host/{ip_address}?key={self.shodan_api_key}"
-             # No timeout on this call, and the indicators are asked about strictly one at a time,
-             # so one hung API holds the whole batch behind it.
-             response = requests.get(url)
+             # The key travels in an Authorization header (HTTP Basic
+             # with the key as username and an empty password, per
+             # Shodan's documented API auth), never in the URL, so it
+             # does not land in server or proxy logs.
+             url = f"https://api.shodan.io/shodan/host/{ip_address}"
+             token = base64.b64encode(f"{self.shodan_api_key}:".encode()).decode()
+             headers = {"Authorization": f"Basic {token}"}
+             self.lookups_performed += 1
+             response = requests.get(url, headers=headers, timeout=10)
              response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
              data = response.json()
              if data and "timestamp" in data:
                  # Example Timestamp: 2023-10-27T10:00:00.000000
                  # Shodan's timestamp is when Shodan last saw or updated the host, not when the indicator
                  # first appeared anywhere. My age for this host starts from a last seen date.
-                 return parser.parse(data["timestamp"])
+                 return self._aware_utc(parser.parse(data["timestamp"]))
              else:
                  logging.info(f"No data found for {ip_address} in Shodan.")
                  return None
@@ -105,12 +121,13 @@ class IndicatorAgeTracker:
 
         try:
             url = f"https://search.censys.io/api/v1/view/domain/{domain}"
-            response = requests.get(url, auth=(self.censys_api_id, self.censys_api_secret))
+            self.lookups_performed += 1
+            response = requests.get(url, auth=(self.censys_api_id, self.censys_api_secret), timeout=10)
             response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
             data = response.json()
 
             if data and "first_seen" in data:
-                return parser.parse(data["first_seen"])
+                return self._aware_utc(parser.parse(data["first_seen"]))
             else:
                 logging.info(f"No data found for {domain} in Censys.")
                 return None
@@ -130,26 +147,30 @@ class IndicatorAgeTracker:
             logging.warning("No IOC ages found.  Run collect_ioc_ages() first.")
             return
 
-        # The dates the two APIs hand me may or may not carry a timezone. A naive date meeting
-        # the aware average built below raises instead of comparing, and nothing here guards it.
-        ages = [age.timestamp() for age in self.ioc_ages.values() if age]  # Convert to timestamps for easier calculations
+        # All stored dates were normalized to aware UTC at parse time,
+        # so this arithmetic cannot hit a naive versus aware TypeError.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ages = {}
+        for ioc, first_seen in self.ioc_ages.items():
+            if first_seen:
+                ages[ioc] = now - self._aware_utc(first_seen)  # age is a duration: now minus first seen
         if not ages:
             logging.warning("No valid IOC ages to analyze.")
             return
 
-        average_age = datetime.datetime.fromtimestamp(sum(ages) / len(ages), tz=datetime.timezone.utc)
-        logging.info(f"Average IOC age: {average_age}")
+        average_age = sum(ages.values(), datetime.timedelta()) / len(ages)
+        logging.info(f"Average IOC age: {average_age} (mean of now minus first seen over {len(ages)} IOC(s))")
+        for ioc, age in ages.items():
+            logging.info(f"Age of {ioc}: {age}")
 
-        # Identify IOCs significantly older than average (e.g., 1 year older)
-        # Stale is measured against the average of this batch, not against any absolute age. A
-        # batch that is uniformly ancient flags nothing, and one indicator alone never can.
+        # Stale is measured against the average age of this batch.
         stale_threshold = datetime.timedelta(days=365)
-        stale_iocs = {ioc: age for ioc, age in self.ioc_ages.items() if age and (average_age - age) > stale_threshold}
+        stale_iocs = {ioc: age for ioc, age in ages.items() if (age - average_age) > stale_threshold}
 
         if stale_iocs:
             logging.warning("Potentially stale IOCs:")
             for ioc, age in stale_iocs.items():
-                logging.warning(f"  {ioc}: {age}")
+                logging.warning(f"  {ioc}: age {age}, first seen {self.ioc_ages[ioc]}")
         else:
             logging.info("No stale IOCs detected.")
 
@@ -178,7 +199,6 @@ def setup_argparse():
     """
     parser = argparse.ArgumentParser(description="Track the age of IOCs using public threat intelligence sources.")
     parser.add_argument("-i", "--iocs", nargs="+", required=True, help="List of IOCs (IP addresses, domains, etc.) to check.")
-    parser.add_argument("--shodan-api-key", help="Shodan API key for looking up IP addresses.  Can also be specified via the SHODAN_API_KEY environment variable.")
     parser.add_argument("--censys-api-id", help="Censys API ID for looking up domains. Can also be specified via the CENSYS_API_ID environment variable.")
     parser.add_argument("--censys-api-secret", help="Censys API secret for looking up domains. Can also be specified via the CENSYS_API_SECRET environment variable.")
     return parser
@@ -191,19 +211,28 @@ def main():
     parser = setup_argparse()
     args = parser.parse_args()
 
-    # Check for environment variables if not provided as arguments.  Environment variables take precedence.
-    shodan_api_key = os.environ.get("SHODAN_API_KEY") or args.shodan_api_key
+    # The Shodan key is taken only from the SHODAN_API_KEY environment
+    # variable, never from the command line, so it does not appear in
+    # shell history or process listings.
+    shodan_api_key = os.environ.get("SHODAN_API_KEY")
     censys_api_id = os.environ.get("CENSYS_API_ID") or args.censys_api_id
     censys_api_secret = os.environ.get("CENSYS_API_SECRET") or args.censys_api_secret
 
 
-    # Input validation (basic check to prevent obvious errors)
     if not args.iocs:
         logging.error("No IOCs provided.  Use the -i or --iocs argument.")
-        return
+        sys.exit(1)
 
     tracker = IndicatorAgeTracker(args.iocs, shodan_api_key, censys_api_id, censys_api_secret)
     tracker.collect_ioc_ages()
+    if tracker.lookups_performed == 0:
+        logging.error("No lookups were performed: no API credentials are configured "
+                      "(set SHODAN_API_KEY and/or CENSYS_API_ID and CENSYS_API_SECRET). "
+                      "This run queried nothing and produced no result.")
+        sys.exit(1)
+    if not any(tracker.ioc_ages.values()):
+        logging.error("No IOC ages were collected from any lookup. No result was produced.")
+        sys.exit(1)
     tracker.analyze_ioc_ages()
 
 if __name__ == "__main__":
@@ -218,8 +247,8 @@ Usage Examples:
 1.  Basic usage with IOCs:
     python tia_indicator_age_tracker.py -i 8.8.8.8 google.com
 
-2.  Using Shodan API key:
-    python tia_indicator_age_tracker.py -i 8.8.8.8 --shodan-api-key YOUR_SHODAN_API_KEY
+2.  Using a Shodan API key (environment variable only):
+    SHODAN_API_KEY=YOUR_SHODAN_API_KEY python tia_indicator_age_tracker.py -i 8.8.8.8
 
 3.  Using Censys API credentials:
     python tia_indicator_age_tracker.py -i google.com --censys-api-id YOUR_CENSYS_API_ID --censys-api-secret YOUR_CENSYS_API_SECRET
