@@ -41,6 +41,8 @@ class IndicatorAgeTracker:
             datetime.datetime: The first seen date of the IOC, or None if not found.
         """
         try:
+            # Every indicator is offered to both sources in turn, whatever it is. A domain gets a
+            # Shodan host query and an IP gets a Censys domain query before I give up on it.
             age = self.get_age_shodan(ioc)
             if age:
                 return age
@@ -67,11 +69,15 @@ class IndicatorAgeTracker:
 
          try:
              url = f"https://api.shodan.io/shodan/host/{ip_address}?key={self.shodan_api_key}"
+             # No timeout on this call, and the indicators are asked about strictly one at a time,
+             # so one hung API holds the whole batch behind it.
              response = requests.get(url)
              response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
              data = response.json()
              if data and "timestamp" in data:
                  # Example Timestamp: 2023-10-27T10:00:00.000000
+                 # Shodan's timestamp is when Shodan last saw or updated the host, not when the indicator
+                 # first appeared anywhere. My age for this host starts from a last seen date.
                  return parser.parse(data["timestamp"])
              else:
                  logging.info(f"No data found for {ip_address} in Shodan.")
@@ -124,6 +130,8 @@ class IndicatorAgeTracker:
             logging.warning("No IOC ages found.  Run collect_ioc_ages() first.")
             return
 
+        # The dates the two APIs hand me may or may not carry a timezone. A naive date meeting
+        # the aware average built below raises instead of comparing, and nothing here guards it.
         ages = [age.timestamp() for age in self.ioc_ages.values() if age]  # Convert to timestamps for easier calculations
         if not ages:
             logging.warning("No valid IOC ages to analyze.")
@@ -133,6 +141,8 @@ class IndicatorAgeTracker:
         logging.info(f"Average IOC age: {average_age}")
 
         # Identify IOCs significantly older than average (e.g., 1 year older)
+        # Stale is measured against the average of this batch, not against any absolute age. A
+        # batch that is uniformly ancient flags nothing, and one indicator alone never can.
         stale_threshold = datetime.timedelta(days=365)
         stale_iocs = {ioc: age for ioc, age in self.ioc_ages.items() if age and (average_age - age) > stale_threshold}
 
